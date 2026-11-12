@@ -1,0 +1,268 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() {
+      return request.auth != null;
+    }
+    function profile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    // A signed-in user only counts if an admin created their profile and it is active.
+    function isActive() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && profile().active == true;
+    }
+    function isAdmin() {
+      return isActive() && profile().role == 'admin';
+    }
+    // Admins and employees can submit/edit units and photos. Viewers (e.g. sales reps) can only look.
+    function canEdit() {
+      return isActive() && profile().get('role', 'employee') in ['admin', 'employee'];
+    }
+    function validStatus(s) {
+      return s in ['active', 'hidden', 'archived', 'deleted'];
+    }
+    function nonEmptyString(v, max) {
+      return v is string && v.size() > 0 && v.size() <= max;
+    }
+    // Any active user may fill EMPTY photo slots on any unit (e.g. answering a photo request),
+    // but not change details or replace/remove existing photos.
+    function storageUrl(u) {
+      return u is string && u.matches('https://firebasestorage[.]googleapis[.]com/.*');
+    }
+    // A photo entry must point at this unit's own folder in our Storage bucket.
+    function validPhoto(p, id) {
+      return p is map
+        && p.path is string && p.path.matches('equipment/' + id + '/[^/]+')
+        && storageUrl(p.url)
+        && (p.get('thumbUrl', null) == null || storageUrl(p.thumbUrl));
+    }
+    function addedOk(added, k, id) {
+      return !(k in added) || validPhoto(request.resource.data.photos[k], id);
+    }
+    // allowReplace: units from the daily report have no "owner", so branch staff may also retake (replace) photos.
+    function onlyAddsPhotos(id, allowReplace) {
+      let photoDiff = request.resource.data.photos.diff(resource.data.photos);
+      let added = photoDiff.addedKeys().union(photoDiff.changedKeys());
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['photos', 'updatedAt', 'updatedByEmail'])
+        && request.resource.data.updatedByEmail == request.auth.token.email
+        && (allowReplace || photoDiff.changedKeys().size() == 0)
+        && photoDiff.removedKeys().size() == 0
+        && added.hasOnly(['rightSide', 'rightSideRear', 'rearEngine', 'leftRear', 'leftSide', 'leftFront', 'front', 'rightFront', 'interior', 'hourMeter', 'serialPlate'])
+        && addedOk(added, 'rightSide', id)
+        && addedOk(added, 'rightSideRear', id)
+        && addedOk(added, 'rearEngine', id)
+        && addedOk(added, 'leftRear', id)
+        && addedOk(added, 'leftSide', id)
+        && addedOk(added, 'leftFront', id)
+        && addedOk(added, 'front', id)
+        && addedOk(added, 'rightFront', id)
+        && addedOk(added, 'interior', id)
+        && addedOk(added, 'hourMeter', id)
+        && addedOk(added, 'serialPlate', id);
+    }
+    function equipmentShapeOk(d) {
+      return nonEmptyString(d.make, 80)
+        && nonEmptyString(d.model, 80)
+        && nonEmptyString(d.warehouse, 80)
+        && d.ein is string && d.ein.size() <= 40
+        && nonEmptyString(d.serial, 60)
+        && validStatus(d.status)
+        && d.photos is map
+        && (d.get('comments', '') is string && d.get('comments', '').size() <= 5000);
+    }
+
+    // ---------- users ----------
+    // Profiles are created/changed only by Cloud Functions (admin SDK).
+    // Active staff can see the staff list (names/emails for "Assign to"); anyone can see their own profile.
+    match /users/{uid} {
+      allow read: if isActive() || (signedIn() && request.auth.uid == uid);
+      // Only email-notification settings can be changed from the app (by the user themselves or an admin);
+      // everything else (role, active, …) goes through Cloud Functions.
+      allow update: if ((isActive() && request.auth.uid == uid) || isAdmin())
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['notifyNewUnits', 'notifyLocations', 'notifyAssigned', 'notifyMessages', 'notifyPhotosReady', 'notifyUpdatedAt'])
+        && request.resource.data.notifyNewUnits in ['all', 'locations', 'none']
+        && request.resource.data.notifyLocations is list
+        && request.resource.data.notifyLocations.size() <= 50
+        && request.resource.data.notifyAssigned is bool
+        && request.resource.data.get('notifyMessages', true) is bool
+        && request.resource.data.get('notifyPhotosReady', true) is bool
+        && request.resource.data.notifyUpdatedAt == request.time;
+      // After signing in with an emailed temporary password, a user clears their own "must change" flag.
+      allow update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['mustChangePassword'])
+        && request.resource.data.mustChangePassword == false;
+      allow create, delete: if false;
+    }
+
+    // ---------- app settings (warehouse list etc.) ----------
+    match /settings/{docId} {
+      // The report link points at a file with costs in it — admins only.
+      allow read: if docId == 'reportImport' ? isAdmin() : isActive();
+      allow write: if isAdmin();
+    }
+
+    // ---------- equipment ----------
+    match /equipment/{id} {
+      allow read: if isActive();
+
+      allow create: if canEdit()
+        && equipmentShapeOk(request.resource.data)
+        && !request.resource.data.keys().hasAny(['followUp', 'importBatch', 'listedAt', 'listedByEmail', 'reportStatus', 'reportStatusCode', 'offReport', 'offReportKeep', 'offReportKeepBy', 'deletedAt', 'deletedByEmail', 'deletedFromStatus', 'deletedReason'])
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.createdByEmail == request.auth.token.email
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.status == 'active';
+
+      // Admins can change anything (including status).
+      // The original submitter can edit details/photos but not status or ownership.
+      allow update: if canEdit()
+        && equipmentShapeOk(request.resource.data)
+        && request.resource.data.createdBy == resource.data.createdBy
+        && request.resource.data.createdAt == resource.data.createdAt
+        // followUp is maintained by the onMessageCreated function only
+        && (isAdmin() || !request.resource.data.diff(resource.data).affectedKeys().hasAny(['followUp', 'listedAt', 'listedByEmail', 'importBatch', 'reportStatus', 'reportStatusCode', 'offReport', 'offReportKeep', 'offReportKeepBy', 'deletedAt', 'deletedByEmail', 'deletedFromStatus', 'deletedReason', 'requestId']))
+        && (
+          isAdmin()
+          || (resource.data.createdBy == request.auth.uid
+              && request.resource.data.status == resource.data.status)
+          || onlyAddsPhotos(id, resource.data.createdBy == 'daily-report')
+        );
+
+      allow delete: if isAdmin();
+
+      // Messages thread on a unit. Anyone active can write (incl. viewers, e.g. a sales rep asking
+      // for a better photo). Only the submitter or an admin can mark a follow-up done.
+      // Messages are never edited; admins can delete them. The unit's followUp flag is set by a Cloud Function.
+      // Private (internal) comments — hidden from view-only accounts. Editable by the submitter or an admin.
+      match /private/{docId} {
+        allow read: if canEdit();
+        allow write: if canEdit()
+          && docId == 'notes'
+          && exists(/databases/$(database)/documents/equipment/$(id))
+          && (isAdmin() || get(/databases/$(database)/documents/equipment/$(id)).data.createdBy == request.auth.uid)
+          && request.resource.data.keys().hasOnly(['text', 'updatedAt', 'updatedByEmail'])
+          && request.resource.data.text is string && request.resource.data.text.size() <= 5000
+          && request.resource.data.updatedAt == request.time
+          && request.resource.data.updatedByEmail == request.auth.token.email;
+      }
+
+      match /messages/{mid} {
+        allow read: if isActive();
+        allow create: if isActive()
+          && exists(/databases/$(database)/documents/equipment/$(id))
+          && request.resource.data.keys().hasOnly(['text', 'kind', 'mentions', 'authorId', 'authorName', 'authorEmail', 'createdAt'])
+          && (request.resource.data.get('mentions', []) is list && request.resource.data.get('mentions', []).size() <= 25)
+          && request.resource.data.authorId == request.auth.uid
+          && request.resource.data.authorEmail == request.auth.token.email
+          && request.resource.data.authorName is string && request.resource.data.authorName.size() <= 120
+          && request.resource.data.createdAt == request.time
+          && request.resource.data.text is string && request.resource.data.text.size() <= 4000
+          && (
+            (request.resource.data.kind in ['note', 'action'] && request.resource.data.text.size() > 0)
+            || (request.resource.data.kind == 'resolved' && canEdit()
+                && (isAdmin() || get(/databases/$(database)/documents/equipment/$(id)).data.createdBy in [request.auth.uid, 'daily-report']))
+          );
+        allow delete: if isAdmin();
+      }
+    }
+
+    // ---------- photo requests (to-do list) ----------
+    function requestShapeOk(d) {
+      return d.make is string && d.make.size() <= 80
+        && d.model is string && d.model.size() <= 80
+        && d.serial is string && d.serial.size() <= 60
+        && d.ein is string && d.ein.size() <= 40
+        && d.warehouse is string && d.warehouse.size() <= 80
+        && d.notes is string && d.notes.size() <= 2000
+        && d.angles is list && d.angles.size() <= 20
+        && (d.dueDate == null || (d.dueDate is string && d.dueDate.size() == 10))
+        && d.status in ['open', 'done']
+        && (d.serial.size() > 0 || d.ein.size() > 0 || d.model.size() > 0)
+        && (d.get('year', null) == null || d.year is int)
+        && (d.get('hours', null) == null || d.hours is number)
+        && (d.get('importBatch', null) == null || (d.importBatch is string && d.importBatch.size() <= 40));
+    }
+    function userExists(uid) {
+      return exists(/databases/$(database)/documents/users/$(uid));
+    }
+    // An assignee must be a real user, and the assignment is recorded as made by whoever made it.
+    function assignmentOk(isCreate) {
+      let d = request.resource.data;
+      let changed = isCreate || d.diff(resource.data).affectedKeys().hasAny(['assignedTo', 'assignedToName', 'assignedBy']);
+      return !changed
+        || (d.assignedTo == null && d.assignedBy == null)
+        || (d.assignedTo is string && userExists(d.assignedTo) && d.assignedBy == request.auth.uid);
+    }
+    // Checking off records the real person and time; reopening clears them; a linked unit must exist.
+    function completionOk() {
+      let d = request.resource.data;
+      let touched = d.diff(resource.data).affectedKeys();
+      return (
+          !touched.hasAny(['status', 'completedAt', 'completedBy', 'completedByName'])
+          || (d.status == 'done' && d.completedBy == request.auth.uid && d.completedAt == request.time)
+          || (d.status == 'open' && d.completedBy == null && d.completedAt == null && d.completedByName == null)
+        )
+        && (!touched.hasAny(['equipmentId']) || d.equipmentId == null
+            || exists(/databases/$(database)/documents/equipment/$(d.equipmentId)));
+    }
+    match /requests/{id} {
+      allow read: if isActive();
+      allow create: if isActive()
+        && requestShapeOk(request.resource.data)
+        && request.resource.data.status == 'open'
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.createdAt == request.time
+        && assignmentOk(true)
+        && (request.resource.data.equipmentId == null
+            || exists(/databases/$(database)/documents/equipment/$(request.resource.data.equipmentId)));
+      // Admins/employees can check a request off / reopen it; the requester (even a viewer) or an admin can also edit it.
+      allow update: if isActive()
+        && requestShapeOk(request.resource.data)
+        && request.resource.data.createdBy == resource.data.createdBy
+        && request.resource.data.createdAt == resource.data.createdAt
+        && completionOk()
+        && assignmentOk(false)
+        && (
+          isAdmin()
+          || resource.data.createdBy == request.auth.uid
+          || (canEdit() && request.resource.data.diff(resource.data).affectedKeys()
+               .hasOnly(['status', 'completedAt', 'completedBy', 'completedByName', 'equipmentId', 'updatedAt']))
+        );
+      allow delete: if isAdmin() || (isActive() && resource.data.createdBy == request.auth.uid);
+    }
+
+    // ---------- request imports (one record per batch → one summary email) ----------
+    // Daily report import: run history and "already imported" markers — written by Cloud Functions only.
+    match /reportRuns/{id} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+    match /reportImports/{id} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+
+    match /requestImports/{id} {
+      allow read: if isAdmin() || (isActive() && resource.data.createdBy == request.auth.uid);
+      allow create: if isActive()
+        && request.resource.data.keys().hasOnly(['count', 'assignedTo', 'createdBy', 'createdByName', 'createdAt'])
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.count is int && request.resource.data.count > 0 && request.resource.data.count <= 1000
+        && (request.resource.data.assignedTo == null || userExists(request.resource.data.assignedTo));
+      allow update, delete: if false;
+    }
+
+    // ---------- email send log (written by Cloud Functions) ----------
+    match /mailLog/{id} {
+      allow read: if isAdmin();
+      allow write: if false;
+    }
+  }
+}

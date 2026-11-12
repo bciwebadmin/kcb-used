@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.firebase/
+*.log
+.env.local
+functions/node_modules/
+functions/.runtimeconfig.json
+functions/*.local
+service-account*.json
+.DS_Store
+functions/.secret.local
+tests/fixtures/
+harness/

@@ -1,0 +1,36 @@
+rules_version = '2';
+
+// Uses cross-service rules (Storage reading Firestore). The first time you deploy,
+// the Firebase CLI / console asks you to allow Storage to read Firestore — say yes.
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function profilePath() {
+      return /databases/(default)/documents/users/$(request.auth.uid);
+    }
+    function isActive() {
+      return request.auth != null
+        && firestore.exists(profilePath())
+        && firestore.get(profilePath()).data.active == true;
+    }
+    function isAdmin() {
+      return isActive() && firestore.get(profilePath()).data.role == 'admin';
+    }
+
+    // equipment/{equipmentId}/{fileName}  (photos + thumbnails)
+    match /equipment/{equipmentId}/{fileName} {
+      allow read: if isActive();
+      // Create only: uploads always use new timestamped names, so nobody can overwrite an existing photo.
+      // Viewers (view-only accounts) can't upload.
+      allow create: if isActive()
+        && firestore.get(profilePath()).data.get('role', 'employee') in ['admin', 'employee']
+        && request.resource.size < 30 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+      allow delete: if isAdmin();
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

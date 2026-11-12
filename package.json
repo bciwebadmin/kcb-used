@@ -1,0 +1,25 @@
+{
+  "name": "kcb-used-equipment",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:emulators": "VITE_USE_EMULATORS=true vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "emulators": "firebase emulators:start --project demo-used-equipment",
+    "test:rules": "firebase emulators:exec --only firestore,storage --project demo-used-equipment \"node --test tests/rules.test.js\"",
+    "deploy": "npm run build && firebase deploy",
+    "test:import": "node --test tests/import-parse.test.mjs && cd functions && node --test ../tests/report-import.test.mjs"
+  },
+  "dependencies": {
+    "firebase": "^13.1.0",
+    "jszip": "^3.10.2",
+    "pdfjs-dist": "^5.7.284"
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "^6.0.0",
+    "vite": "^8.3.5"
+  }
+}
